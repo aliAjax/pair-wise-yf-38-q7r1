@@ -27,6 +27,22 @@ class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 
 
+class ReleaseDenied(PermissionDenied):
+    """The release gate found a terminal breach: export must be rejected.
+
+    Examples: dataset revoked downstream, grant expired/revoked, application
+    no longer approved or the recorded purpose has changed.
+    """
+
+
+class TemporarilyBlocked(DomainError):
+    """The release gate cannot be satisfied right now but may be later.
+
+    The export stays queued and the step remains unconfirmed; a later retry
+    may proceed (e.g. dataset currently restricted, quota momentarily used up).
+    """
+
+
 class Role(str, Enum):
     viewer = "viewer"
     admin = "admin"
