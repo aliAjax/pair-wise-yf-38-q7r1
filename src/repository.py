@@ -117,15 +117,17 @@ class SQLiteRepository:
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT version FROM entities WHERE id = ?", (entity_id,)
+                "SELECT * FROM entities WHERE id = ?", (entity_id,)
             ).fetchone()
             if not row:
                 raise NotFoundError("entity not found: " + entity_id)
             current_version = int(row["version"])
             if expected_version is not None and current_version != int(expected_version):
+                current = self._entity_from_row(row)
                 raise ConflictError(
                     "version conflict: expected %s, found %s"
-                    % (expected_version, current_version)
+                    % (expected_version, current_version),
+                    details={"current": current},
                 )
             connection.execute(
                 "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
@@ -139,6 +141,192 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def conditional_update(self, entity_id, from_status, expected_version, to_status, data_patch=None):
+        """Conditionally update status, merged data and version.
+
+        The write only lands when the entity is in ``from_status`` (when given)
+        and at ``expected_version`` (when given). Returns the updated entity, or
+        ``None`` when the condition failed so the caller can surface a conflict.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, version, data FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            current_status = row["status"]
+            current_version = int(row["version"])
+            if from_status is not None and current_status != from_status:
+                return None
+            if expected_version is not None and current_version != int(expected_version):
+                return None
+            data = json.loads(row["data"])
+            if data_patch:
+                data.update(data_patch)
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ?",
+                (to_status if to_status else current_status, payload, now, entity_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
+    def record_step(self, entity_id, step_name, expected_version):
+        """Record a durable workflow step on a queued export task.
+
+        Returns the updated entity, or ``None`` when the task is no longer
+        queued or the version moved. Already-confirmed steps are skipped by the
+        caller, so retries never re-run a confirmed step.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, version, data FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + entity_id)
+            current_version = int(row["version"])
+            if row["status"] != "queued":
+                return None
+            if expected_version is not None and current_version != int(expected_version):
+                return None
+            data = json.loads(row["data"])
+            steps = data.setdefault("steps", {})
+            steps[step_name] = True
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET version = version + 1, data = ?, updated_at = ? WHERE id = ?",
+                (payload, utcnow(), entity_id),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(entity_id)
+
+    def deduct_quota(self, grant_id, amount):
+        """Conditionally deduct quota from a grant.
+
+        Returns ``True`` when the deduction landed, ``False`` when the grant is
+        missing or has insufficient remaining quota.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT data FROM entities WHERE id = ? AND kind = 'grant'", (grant_id,)
+            ).fetchone()
+            if not row:
+                return False
+            data = json.loads(row["data"])
+            total = int(data.get("quota_total", 0))
+            used = int(data.get("quota_used", 0))
+            if used + int(amount) > total:
+                return False
+            data["quota_used"] = used + int(amount)
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET data = ?, updated_at = ? WHERE id = ?",
+                (payload, utcnow(), grant_id),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def refund_quota(self, grant_id, amount):
+        """Return quota to a grant (used when a later release step fails)."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT data FROM entities WHERE id = ? AND kind = 'grant'", (grant_id,)
+            ).fetchone()
+            if not row:
+                return False
+            data = json.loads(row["data"])
+            used = int(data.get("quota_used", 0))
+            data["quota_used"] = max(0, used - int(amount))
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            connection.execute(
+                "UPDATE entities SET data = ?, updated_at = ? WHERE id = ?",
+                (payload, utcnow(), grant_id),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def issue_receipt(self, task_id, expected_version, receipt_id, receipt_data):
+        """Atomically issue a receipt and mark the export task released.
+
+        The receipt and the task status move in one transaction, so a retry can
+        never leave a second receipt or a half-released task. Returns the
+        updated task, or ``None`` when the task is no longer queued or the
+        version moved.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, version, data FROM entities WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not row:
+                raise NotFoundError("entity not found: " + task_id)
+            current_version = int(row["version"])
+            if row["status"] != "queued":
+                return None
+            if expected_version is not None and current_version != int(expected_version):
+                return None
+            data = json.loads(row["data"])
+            steps = data.setdefault("steps", {})
+            steps["receipt_issued"] = True
+            data["receipt_id"] = receipt_id
+            payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            now = utcnow()
+            connection.execute(
+                "UPDATE entities SET status = 'released', version = version + 1, data = ?, updated_at = ? "
+                "WHERE id = ?",
+                (payload, now, task_id),
+            )
+            connection.execute(
+                "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
+                "VALUES (?, 'receipt', 'issued', 1, ?, 'system', ?, ?)",
+                (receipt_id, json.dumps(receipt_data, ensure_ascii=False, sort_keys=True), now, now),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return self.get_entity(task_id)
+
+    def list_blocked_tasks(self, dataset_id):
+        return [
+            entity
+            for entity in self.list_entities(kind="export_task")
+            if entity["status"] == "blocked" and entity["data"].get("dataset_id") == dataset_id
+        ]
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:

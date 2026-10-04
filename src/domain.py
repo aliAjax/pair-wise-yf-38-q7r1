@@ -1,10 +1,24 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
 
 
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 class DomainError(Exception):
-    """Base error for domain failures."""
+    """Base error for domain failures.
+
+    ``details`` carries machine-readable context (e.g. the latest entity on a
+    version conflict) so callers can observe the current state without a second
+    round-trip.
+    """
+
+    def __init__(self, message, details=None):
+        super().__init__(message)
+        self.details = details or {}
 
 
 class ValidationError(DomainError):

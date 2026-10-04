@@ -5,6 +5,7 @@ from .domain import (
     InvalidTransition,
     PermissionDenied,
     ValidationError,
+    utcnow,
 )
 
 
@@ -39,18 +40,163 @@ def _validate_grant_activate(actor, entity, data, lookup):
     return {"activated_by": actor.user_id}
 
 
-CUSTOM_CREATE = {'dataset': _validate_dataset, 'application': _validate_application}
-CUSTOM_TRANSITIONS = {('application', 'approve'): _validate_approve, ('grant', 'activate'): _validate_grant_activate}
+def _validate_export_task(actor, data, lookup):
+    dataset = _find_one(lookup, "dataset", "id", data.get("dataset_id"))
+    if not dataset:
+        raise ValidationError("dataset does not exist")
+    application = _find_one(lookup, "application", "id", data.get("application_id"))
+    if not application:
+        raise ValidationError("application does not exist")
+    grant = _find_one(lookup, "grant", "id", data.get("grant_id"))
+    if not grant:
+        raise ValidationError("grant does not exist")
+    if application["data"].get("dataset_id") != dataset["id"]:
+        raise ValidationError("application does not reference dataset")
+    if grant["data"].get("application_id") != application["id"]:
+        raise ValidationError("grant does not reference application")
+    if grant["data"].get("dataset_id") != dataset["id"]:
+        raise ValidationError("grant does not reference dataset")
+    if not str(data.get("purpose", "")).strip():
+        raise ValidationError("purpose is required")
+    quota = data.get("quota")
+    if quota is None or int(quota) <= 0:
+        raise ValidationError("quota must be a positive integer")
+    # Snapshot the approved purpose so a later purpose change can be detected.
+    return {
+        "purpose_snapshot": application["data"].get("purpose"),
+        "steps": {},
+    }
+
+
+def check_export_release(task, dataset, application, grant, now=None):
+    """Return ``(ok, reason)`` for releasing an export task.
+
+    The dataset, application, grant and export task form a single consistency
+    ledger: a release is valid only when the dataset is published, the
+    application is approved and unexpired with an unchanged purpose, and the
+    grant is active inside its validity window with enough remaining quota.
+    """
+    now = str(now or utcnow())
+    if dataset is None or application is None or grant is None:
+        return False, "referenced entity is missing"
+    if dataset["status"] != "published":
+        return False, "dataset is not published"
+    if application["status"] != "approved":
+        return False, "application is not approved"
+    if application["data"].get("dataset_id") != dataset["id"]:
+        return False, "application does not reference dataset"
+    if str(application["data"].get("expires_at", "")) < now:
+        return False, "application has expired"
+    if task["data"].get("purpose_snapshot") != application["data"].get("purpose"):
+        return False, "application purpose has changed"
+    if grant["status"] == "revoked":
+        return False, "grant has been revoked"
+    if grant["status"] == "expired":
+        return False, "grant has expired"
+    if grant["status"] != "active":
+        return False, "grant is not active"
+    if grant["data"].get("application_id") != application["id"]:
+        return False, "grant does not reference application"
+    if grant["data"].get("dataset_id") != dataset["id"]:
+        return False, "grant does not reference dataset"
+    if str(grant["data"].get("starts_at", "")) > now:
+        return False, "grant is not yet valid"
+    if str(grant["data"].get("expires_at", "")) < now:
+        return False, "grant has expired"
+    remaining = int(grant["data"].get("quota_total", 0)) - int(grant["data"].get("quota_used", 0))
+    if int(task["data"].get("quota", 0)) > remaining:
+        return False, "grant quota insufficient"
+    return True, None
+
+
+CUSTOM_CREATE = {
+    'dataset': _validate_dataset,
+    'application': _validate_application,
+    'export_task': _validate_export_task,
+}
+CUSTOM_TRANSITIONS = {
+    ('application', 'approve'): _validate_approve,
+    ('grant', 'activate'): _validate_grant_activate,
+}
 
 
 class RuleEngine:
-    ALIASES = {'datasets': 'dataset', 'applications': 'application', 'grants': 'grant'}
-    INITIAL_STATUS = {'dataset': 'registered', 'application': 'draft', 'grant': 'issued'}
-    TRANSITIONS = {'dataset': {'restrict': (('registered',), 'restricted'), 'publish': (('restricted',), 'published')}, 'application': {'submit': (('draft',), 'submitted'), 'review': (('submitted',), 'under_review'), 'approve': (('under_review',), 'approved'), 'reject': (('under_review',), 'rejected'), 'withdraw': (('submitted', 'under_review'), 'withdrawn')}, 'grant': {'activate': (('issued',), 'active'), 'revoke': (('active',), 'revoked'), 'expire': (('active',), 'expired')}}
-    CREATE_REQUIRED = {'dataset': ('name', 'access_policy'), 'application': ('dataset_id', 'applicant_id', 'purpose'), 'grant': ('application_id', 'dataset_id', 'recipient')}
-    ACTION_REQUIRED = {('dataset', 'restrict'): ('reason',), ('application', 'review'): ('committee_id',), ('application', 'approve'): ('approvals', 'terms', 'expires_at'), ('application', 'reject'): ('reason',), ('application', 'withdraw'): ('reason',), ('grant', 'activate'): ('starts_at', 'expires_at'), ('grant', 'revoke'): ('reason',), ('grant', 'expire'): ('expired_at',)}
-    CREATE_ROLES = {'dataset': ('admin', 'committee'), 'application': ('admin', 'applicant'), 'grant': ('admin', 'committee')}
-    ROLE_ACTIONS = {'restrict': ('admin', 'committee'), 'publish': ('admin', 'committee'), 'submit': ('admin', 'applicant'), 'review': ('admin', 'committee'), 'approve': ('admin', 'committee'), 'reject': ('admin', 'committee'), 'withdraw': ('admin', 'applicant'), 'activate': ('admin', 'committee'), 'revoke': ('admin', 'committee'), 'expire': ('admin', 'committee')}
+    ALIASES = {
+        'datasets': 'dataset',
+        'applications': 'application',
+        'grants': 'grant',
+        'export_tasks': 'export_task',
+        'receipts': 'receipt',
+    }
+    INITIAL_STATUS = {
+        'dataset': 'registered',
+        'application': 'draft',
+        'grant': 'issued',
+        'export_task': 'queued',
+        'receipt': 'issued',
+    }
+    TRANSITIONS = {
+        'dataset': {
+            'restrict': (('registered', 'published'), 'restricted'),
+            'publish': (('registered', 'restricted'), 'published'),
+        },
+        'application': {
+            'submit': (('draft',), 'submitted'),
+            'review': (('submitted',), 'under_review'),
+            'approve': (('under_review',), 'approved'),
+            'reject': (('under_review',), 'rejected'),
+            'withdraw': (('submitted', 'under_review'), 'withdrawn'),
+            'amend': (('draft', 'submitted', 'under_review', 'approved'), None),
+        },
+        'grant': {
+            'activate': (('issued',), 'active'),
+            'revoke': (('active',), 'revoked'),
+            'expire': (('active',), 'expired'),
+        },
+        'export_task': {
+            'cancel': (('queued', 'blocked'), 'cancelled'),
+        },
+        'receipt': {},
+    }
+    CREATE_REQUIRED = {
+        'dataset': ('name', 'access_policy'),
+        'application': ('dataset_id', 'applicant_id', 'purpose'),
+        'grant': ('application_id', 'dataset_id', 'recipient'),
+        'export_task': ('dataset_id', 'application_id', 'grant_id', 'purpose', 'quota'),
+    }
+    ACTION_REQUIRED = {
+        ('dataset', 'restrict'): ('reason',),
+        ('application', 'review'): ('committee_id',),
+        ('application', 'approve'): ('approvals', 'terms', 'expires_at'),
+        ('application', 'reject'): ('reason',),
+        ('application', 'withdraw'): ('reason',),
+        ('application', 'amend'): ('purpose', 'reason'),
+        ('grant', 'activate'): ('starts_at', 'expires_at'),
+        ('grant', 'revoke'): ('reason',),
+        ('grant', 'expire'): ('expired_at',),
+        ('export_task', 'cancel'): ('reason',),
+    }
+    CREATE_ROLES = {
+        'dataset': ('admin', 'committee'),
+        'application': ('admin', 'applicant'),
+        'grant': ('admin', 'committee'),
+        'export_task': ('admin', 'applicant'),
+        'receipt': (),
+    }
+    ROLE_ACTIONS = {
+        'restrict': ('admin', 'committee'),
+        'publish': ('admin', 'committee'),
+        'submit': ('admin', 'applicant'),
+        'review': ('admin', 'committee'),
+        'approve': ('admin', 'committee'),
+        'reject': ('admin', 'committee'),
+        'withdraw': ('admin', 'applicant'),
+        'amend': ('admin', 'applicant'),
+        'activate': ('admin', 'committee'),
+        'revoke': ('admin', 'committee'),
+        'expire': ('admin', 'committee'),
+        'cancel': ('admin', 'applicant'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)
@@ -81,8 +227,10 @@ class RuleEngine:
         self._require(data, self.CREATE_REQUIRED.get(kind, ()))
         custom = CUSTOM_CREATE.get(kind)
         if custom:
-            custom(actor, data, lookup)
-        return dict(data)
+            extra = custom(actor, data, lookup) or {}
+            data = dict(data)
+            data.update(extra)
+        return data
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
